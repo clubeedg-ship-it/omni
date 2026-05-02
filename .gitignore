@@ -1,0 +1,10 @@
+.env
+*.key
+*.pem
+models/
+*.gguf
+data/
+logs/
+*.log
+.DS_Store
+node_modules/
