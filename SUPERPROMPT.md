@@ -53,7 +53,7 @@ nvidia-ctk runtime configure --runtime=docker && systemctl restart docker
 
 **Verify**: `docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi` — MUST pass.
 
-**Dirs**: `mkdir -p /opt/omni/{models,data/{honcho-pg,redis,whisper-cache},logs,config,tests}`
+**Dirs**: `mkdir -p /opt/omni/models /opt/omni/data/honcho-pg /opt/omni/data/redis /opt/omni/data/whisper-cache /opt/omni/logs /opt/omni/config /opt/omni/tests`
 
 **Model**: Search HuggingFace for exact Qwen3.6-27B Q4_K_M GGUF filename. Download to `/opt/omni/models/`. Log actual filename as decision if it differs from spec.
 
@@ -184,7 +184,7 @@ Create `/opt/omni/tests/validate.sh`:
 ```bash
 #!/bin/bash
 PASS=0; FAIL=0
-check() { if eval "$2" >/dev/null 2>&1; then echo "✓ $1"; ((PASS++)); else echo "✗ $1"; ((FAIL++)); fi }
+check() { if eval "$2" >/dev/null 2>&1; then echo "PASS $1"; ((PASS++)); else echo "FAIL $1"; ((FAIL++)); fi }
 
 check "GPU in container" "docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi"
 check "llama-server health" "curl -sf http://localhost:8080/health"
@@ -254,7 +254,7 @@ Write `.project/reports/phase-5-summary.md`:
 - What works (test results)
 - What needs human attention
 - Decisions made during bootstrap
-- Next steps for Agent lane (Hermes, MCP bridge, gateway)
+- Next steps for Agent lane (Hermes, Paperclip HTTP skills, gateway config)
 
 Commit and push: `phase-5: bootstrap complete`
 
@@ -262,9 +262,9 @@ Commit and push: `phase-5: bootstrap complete`
 
 ## If you get stuck
 
-- OOM → reduce context to 131072, log D-006
-- Honcho won't start → skip deriver, get API up, log known issue
-- Paperclip no Docker image → build from source
-- Model filename changed → use whatever Q4_K_M GGUF exists for Qwen3 27B
-- Port conflict → change external port, log decision
-- True blocker → stop, push what you have, report
+- OOM: reduce context to 131072, log decision
+- Honcho won't start: skip deriver, get API up, log known issue
+- Paperclip no Docker image: build from source
+- Model filename changed: use whatever Q4_K_M GGUF exists for Qwen3 27B
+- Port conflict: change external port, log decision
+- True blocker: stop, push what you have, report
