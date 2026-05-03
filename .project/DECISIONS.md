@@ -14,3 +14,9 @@ Paperclip manages its own embedded PG. Honcho gets pgvector on :5432. No sharing
 
 ## D-005: GPU time-sharing
 llama-server holds ~20-22GB persistently. Whisper bursts into remaining VRAM. If OOM, reduce context to 131072.
+
+## D-006: Hermes-Paperclip bridge is direct HTTP, not MCP
+Paperclip exposes REST on :3100. Hermes has a skills system for callable Python functions. Write a Hermes skill that does `requests.post("http://localhost:3100/api/issues", ...)`. No MCP server, no protocol layer, no discovery overhead. Paperclip pushes work to Hermes via webhook heartbeat. Hermes pushes results back via REST.
+
+## D-007: Multi-agent inference via queue, not parallel slots
+llama-server runs with `-np 1` (single slot). All agents (Second Brain triage, outreach, any future agent) share one inference queue. Requests queue natively at the API level. No VRAM duplication. No need for `-np 2` which would halve context or OOM.
