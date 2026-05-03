@@ -7,7 +7,7 @@ Hermes `gateway/platforms/whatsapp.py` (46KB) + `whatsapp_identity.py` (6KB) han
 Hermes `gateway/platforms/email.py` (27KB) handles IMAP ingestion with HTML stripping. Custom IMAP listener spec killed.
 
 ## D-003: Honcho deriver → local llama-server
-Configure `DERIVER_MODEL_CONFIG__TRANSPORT` to `http://llama-server:8080/v1`. No cloud APIs.
+Configure `DERIVER_MODEL_CONFIG__TRANSPORT=openai` + `DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=http://llama-server:8080/v1`. No cloud APIs. Same pattern for all 5 Honcho features (deriver, dialectic levels, summary, dream, embeddings). Set `LLM_OPENAI_API_KEY=sk-dummy-local` (required but not validated by llama-server).
 
 ## D-004: Separate Postgres instances
 Paperclip manages its own embedded PG. Honcho gets pgvector on :5432. No sharing.
@@ -16,7 +16,20 @@ Paperclip manages its own embedded PG. Honcho gets pgvector on :5432. No sharing
 llama-server holds ~20-22GB persistently. Whisper bursts into remaining VRAM. If OOM, reduce context to 131072.
 
 ## D-006: Hermes-Paperclip bridge is direct HTTP, not MCP
-Paperclip exposes REST on :3100. Hermes has a skills system for callable Python functions. Write a Hermes skill that does `requests.post("http://localhost:3100/api/issues", ...)`. No MCP server, no protocol layer, no discovery overhead. Paperclip pushes work to Hermes via webhook heartbeat. Hermes pushes results back via REST.
+Paperclip exposes REST on :3100. Hermes skills system calls it directly. No protocol layer.
 
 ## D-007: Multi-agent inference via queue, not parallel slots
-llama-server runs with `-np 1` (single slot). All agents (Second Brain triage, outreach, any future agent) share one inference queue. Requests queue natively at the API level. No VRAM duplication. No need for `-np 2` which would halve context or OOM.
+`-np 1` single slot. All agents share one inference queue natively.
+
+## D-008: llama-server requires --jinja --reasoning-format deepseek for tool calling
+Source: Qwen official llama.cpp docs. Without these flags, Qwen3 tool calls are not parsed. The corrected command is:
+```
+-m /models/Qwen3.6-27B-Q4_K_M.gguf -ngl 99 -c 262144 -np 1 -fa on --cache-type-k q4_0 --cache-type-v q4_0 --jinja --reasoning-format deepseek --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0 --host 0.0.0.0 --port 8080
+```
+Also added Qwen-recommended sampling params (temp 0.6, top-k 20, top-p 0.95, min-p 0).
+
+## D-009: Separate CPU-only embedding server on port 8081
+llama-server with a chat GGUF does NOT serve /v1/embeddings. Solution: run a second llama-server instance on port 8081, CPU-only, with `nomic-embed-text-v1.5.f16.gguf` (~64MB, no GPU needed). Honcho points `EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://embedding-server:8081/v1`. The embedding server command:
+```
+llama-server -m /models/nomic-embed-text-v1.5.f16.gguf --embeddings -c 8192 --rope-scaling yarn --rope-freq-scale 0.75 -ngl 0 --host 0.0.0.0 --port 8081
+```
