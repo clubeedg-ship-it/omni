@@ -1,14 +1,14 @@
 # SUPERPROMPT — VM Bootstrap
 
-Read `AGENTS.md` first for invariants. Read `.project/STATE.md` for targets. Then execute this top-to-bottom. Do not re-read those files during execution — you have what you need.
+Read `AGENTS.md` first for invariants. Read `.project/STATE.md` for targets. Read `.project/DECISIONS.md` for settled rules (D-001 through D-009). Then execute top-to-bottom. Do not re-read those files during execution.
 
-Make every decision yourself. Log non-obvious ones in `.project/DECISIONS.md`. Commit after each phase. Update `.project/STATE.md` runtime section and `.project/QUEUE.md` statuses as you go. Push everything at the end with a summary.
+Make every decision yourself. Log non-obvious ones in `.project/DECISIONS.md`. Commit after each phase. Update `.project/STATE.md` and `.project/QUEUE.md` as you go. Push at the end with a summary.
 
 ---
 
 ## Phase 0 — Recon
 
-Audit the VM. Save raw output to `.project/reports/phase-0-vm-audit.md`.
+Audit the VM. Save to `.project/reports/phase-0-vm-audit.md`.
 
 ```bash
 echo "=== GPU ===" && lspci | grep -i nvidia && nvidia-smi 2>/dev/null
@@ -19,13 +19,9 @@ echo "=== OS ===" && cat /etc/os-release | head -6
 echo "=== DOCKER ===" && docker --version 2>/dev/null && docker compose version 2>/dev/null
 echo "=== NVIDIA CONTAINER ===" && nvidia-ctk --version 2>/dev/null
 echo "=== GPU CONTAINER TEST ===" && docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi 2>/dev/null
-echo "=== PORTS ===" && ss -tlnp | grep -E '(3100|5432|6379|8000|8080|9000)'
+echo "=== PORTS ===" && ss -tlnp | grep -E '(3100|5432|6379|8000|8080|8081|9000)'
 echo "=== NVIDIA DEVICES ===" && ls /dev/nvidia* 2>/dev/null
 ```
-
-From the output, fill `.project/STATE.md` runtime section. Identify gaps.
-
-Write a one-paragraph gap summary at the bottom of the audit report. This is your Phase 1 todo list.
 
 Commit: `phase-0: vm audit`
 
@@ -55,7 +51,9 @@ nvidia-ctk runtime configure --runtime=docker && systemctl restart docker
 
 **Dirs**: `mkdir -p /opt/omni/models /opt/omni/data/honcho-pg /opt/omni/data/redis /opt/omni/data/whisper-cache /opt/omni/logs /opt/omni/config /opt/omni/tests`
 
-**Model**: Search HuggingFace for exact Qwen3.6-27B Q4_K_M GGUF filename. Download to `/opt/omni/models/`. Log actual filename as decision if it differs from spec.
+**Models**:
+1. Search HuggingFace for exact Qwen3.6-27B Q4_K_M GGUF filename. Download to `/opt/omni/models/`.
+2. Download `nomic-embed-text-v1.5.f16.gguf` (~64MB) from `nomic-ai/nomic-embed-text-v1.5-GGUF` to `/opt/omni/models/`.
 
 Commit: `phase-1: prerequisites installed`
 
@@ -65,7 +63,9 @@ Commit: `phase-1: prerequisites installed`
 
 Create `/opt/omni/docker-compose.yml`. Build incrementally — verify each service before adding the next.
 
-### 2a: llama-server + Redis
+### 2a: llama-server + embedding-server + Redis
+
+**CRITICAL: llama-server MUST have `--jinja --reasoning-format deepseek` for tool calling to work (D-008).**
 
 ```yaml
 services:
@@ -79,6 +79,8 @@ services:
       -m /models/<ACTUAL_FILENAME>.gguf
       -ngl 99 -c 262144 -np 1 -fa on
       --cache-type-k q4_0 --cache-type-v q4_0
+      --jinja --reasoning-format deepseek
+      --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0
       --host 0.0.0.0 --port 8080
     volumes: ["/opt/omni/models:/models:ro"]
     ports: ["8080:8080"]
@@ -89,6 +91,21 @@ services:
       start_period: 300s
     restart: unless-stopped
 
+  embedding-server:
+    image: ghcr.io/ggerganov/llama.cpp:server-latest
+    command: >-
+      -m /models/nomic-embed-text-v1.5.f16.gguf
+      --embeddings -c 8192 -ngl 0
+      --rope-scaling yarn --rope-freq-scale 0.75
+      --host 0.0.0.0 --port 8081
+    volumes: ["/opt/omni/models:/models:ro"]
+    ports: ["8081:8081"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 5s
+    restart: unless-stopped
+
   redis:
     image: redis:7-alpine
     command: redis-server --appendonly yes
@@ -97,11 +114,25 @@ services:
     restart: unless-stopped
 ```
 
+After starting, run:
+```bash
+# Get the exact model ID llama-server reports
+curl -s http://localhost:8080/v1/models | jq '.data[0].id'
+# Use this ID for all Honcho MODEL env vars
+```
+
 Test inference:
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}'
+```
+
+Test embedding:
+```bash
+curl -s http://localhost:8081/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":"search_query: test embedding","model":"nomic-embed-text-v1.5"}'
 ```
 
 If OOM: reduce `-c 262144` to `-c 131072`. Log as decision. Record `nvidia-smi` VRAM.
@@ -125,7 +156,18 @@ If OOM: reduce `-c 262144` to `-c 131072`. Log as decision. Record `nvidia-smi` 
 
 ### 2c: Honcho
 
-Research: clone `plastic-labs/honcho`, read `config.toml.example` and `.env.template`. Find env vars to point deriver at local OpenAI-compatible endpoint. Document findings.
+**Honcho local LLM config is fully resolved (D-003, D-009).** Every feature uses this pattern:
+```
+<FEATURE>_MODEL_CONFIG__TRANSPORT=openai
+<FEATURE>_MODEL_CONFIG__MODEL=<model-id-from-/v1/models>
+<FEATURE>_MODEL_CONFIG__OVERRIDES__BASE_URL=http://llama-server:8080/v1
+```
+
+For embeddings, point at the CPU embedding server instead:
+```
+EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://embedding-server:8081/v1
+EMBEDDING_MODEL_CONFIG__MODEL=nomic-embed-text-v1.5
+```
 
 ```yaml
   honcho-db:
@@ -145,15 +187,52 @@ Research: clone `plastic-labs/honcho`, read `config.toml.example` and `.env.temp
     build: ./honcho
     depends_on:
       honcho-db: {condition: service_healthy}
+      llama-server: {condition: service_healthy}
+      embedding-server: {condition: service_healthy}
     environment:
       DB_CONNECTION_URI: postgresql+psycopg://honcho:${HONCHO_DB_PASSWORD}@honcho-db:5432/honcho
       AUTH_USE_AUTH: "false"
       SENTRY_ENABLED: "false"
+      LLM_OPENAI_API_KEY: "sk-dummy-local"
+      # Deriver
+      DERIVER_MODEL_CONFIG__TRANSPORT: openai
+      DERIVER_MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      # Summary
+      SUMMARY_MODEL_CONFIG__TRANSPORT: openai
+      SUMMARY_MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      # Dream
+      DREAM_DEDUCTION_MODEL_CONFIG__TRANSPORT: openai
+      DREAM_DEDUCTION_MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DREAM_DEDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      DREAM_INDUCTION_MODEL_CONFIG__TRANSPORT: openai
+      DREAM_INDUCTION_MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DREAM_INDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      # Dialectic (all 5 levels)
+      DIALECTIC_LEVELS__minimal__MODEL_CONFIG__TRANSPORT: openai
+      DIALECTIC_LEVELS__minimal__MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      DIALECTIC_LEVELS__low__MODEL_CONFIG__TRANSPORT: openai
+      DIALECTIC_LEVELS__low__MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      DIALECTIC_LEVELS__medium__MODEL_CONFIG__TRANSPORT: openai
+      DIALECTIC_LEVELS__medium__MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      DIALECTIC_LEVELS__high__MODEL_CONFIG__TRANSPORT: openai
+      DIALECTIC_LEVELS__high__MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      DIALECTIC_LEVELS__max__MODEL_CONFIG__TRANSPORT: openai
+      DIALECTIC_LEVELS__max__MODEL_CONFIG__MODEL: "${LLAMA_MODEL_ID}"
+      DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__BASE_URL: http://llama-server:8080/v1
+      # Embeddings (CPU server on :8081)
+      EMBEDDING_MODEL_CONFIG__TRANSPORT: openai
+      EMBEDDING_MODEL_CONFIG__MODEL: nomic-embed-text-v1.5
+      EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL: http://embedding-server:8081/v1
+      VECTOR_STORE_TYPE: pgvector
     ports: ["8000:8000"]
     restart: unless-stopped
 ```
-
-If deriver can't use local LLM, log as known issue and move on.
 
 ### 2d: Paperclip
 
@@ -170,6 +249,7 @@ CMD ["pnpm", "dev"]
 Create `/opt/omni/.env`:
 ```env
 HONCHO_DB_PASSWORD=<openssl rand -hex 16>
+LLAMA_MODEL_ID=<value from curl localhost:8080/v1/models>
 COMPOSE_PROJECT_NAME=omni
 ```
 
@@ -189,6 +269,8 @@ check() { if eval "$2" >/dev/null 2>&1; then echo "PASS $1"; ((PASS++)); else ec
 check "GPU in container" "docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu24.04 nvidia-smi"
 check "llama-server health" "curl -sf http://localhost:8080/health"
 check "llama-server inference" "curl -sf http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Say OK\"}],\"max_tokens\":5}'"
+check "embedding-server health" "curl -sf http://localhost:8081/health"
+check "embedding-server embed" "curl -sf http://localhost:8081/v1/embeddings -H 'Content-Type: application/json' -d '{\"input\":\"test\",\"model\":\"nomic-embed-text-v1.5\"}'"
 check "whisper health" "curl -sf http://localhost:9000/health"
 check "honcho api" "curl -sf http://localhost:8000/"
 check "paperclip api" "curl -sf http://localhost:3100/"
@@ -235,7 +317,7 @@ docker compose -f /opt/omni/docker-compose.yml ps --format "table {{.Name}}\t{{.
 echo "=== GPU ==="
 nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader
 echo "=== Ports ==="
-for p in 8080 9000 8000 3100 5432 6379; do
+for p in 8080 8081 9000 8000 3100 5432 6379; do
   (echo >/dev/tcp/localhost/$p) 2>/dev/null && echo "$p: open" || echo "$p: closed"
 done
 ```
@@ -246,7 +328,7 @@ Commit: `phase-4: systemd + monitoring`
 
 ## Phase 5 — Final report
 
-Update `.project/STATE.md` runtime with real values. Set phase to `M1-STACK-UP`.
+Update `.project/STATE.md` with real values.
 Update `.project/QUEUE.md` statuses.
 
 Write `.project/reports/phase-5-summary.md`:
@@ -254,7 +336,7 @@ Write `.project/reports/phase-5-summary.md`:
 - What works (test results)
 - What needs human attention
 - Decisions made during bootstrap
-- Next steps for Agent lane (Hermes, Paperclip HTTP skills, gateway config)
+- Next steps for Agent lane (Hermes install, Paperclip HTTP skills, gateway config)
 
 Commit and push: `phase-5: bootstrap complete`
 
@@ -265,6 +347,8 @@ Commit and push: `phase-5: bootstrap complete`
 - OOM: reduce context to 131072, log decision
 - Honcho won't start: skip deriver, get API up, log known issue
 - Paperclip no Docker image: build from source
-- Model filename changed: use whatever Q4_K_M GGUF exists for Qwen3 27B
+- Model filename changed: use whatever Q4_K_M GGUF exists for Qwen3.6 27B
 - Port conflict: change external port, log decision
+- Tool calling broken: verify --jinja --reasoning-format deepseek flags are present
+- Embeddings fail: verify embedding-server is running on 8081 with --embeddings flag
 - True blocker: stop, push what you have, report
