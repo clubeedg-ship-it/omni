@@ -4,7 +4,7 @@
 1. This file (done)
 2. `.project/STATE.md` — where we are
 3. `.project/QUEUE.md` — what to do next
-4. `SUPERPROMPT.md` — how to do it (read once, execute fully)
+4. `.project/DECISIONS.md` — settled rules
 
 ## Invariants
 1. **Local-first.** No cloud LLM APIs. All inference on the local RTX 4090 via llama-server.
@@ -24,7 +24,8 @@
 ## Port map
 | Port | Service |
 |------|---------|
-| 8080 | llama-server |
+| 8080 | llama-server (GPU, inference + tool calling) |
+| 8081 | embedding-server (CPU, nomic-embed-text-v1.5) |
 | 9000 | faster-whisper |
 | 8000 | Honcho API |
 | 5432 | Honcho Postgres |
